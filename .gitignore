@@ -1,0 +1,4 @@
+OpenVoice/
+OpenVoiceV2/
+__pycache__/
+src/controller/__pycache__/

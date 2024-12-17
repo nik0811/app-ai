@@ -3,10 +3,7 @@ import logging
 import numpy as np
 from faster_whisper import WhisperModel
 import asyncio
-import websockets
-import signal
 import torch
-import json
 import difflib
 from typing import List, Dict
 from dataclasses import dataclass
@@ -35,12 +32,25 @@ class AudioProcessor:
     def __init__(self, config: AudioConfig):
         self.config = config
         self.buffer = np.array([], dtype=np.float32)
+        # Add parameters for audio enhancement
+        self.noise_reduce_strength = 0.15
+        self.noise_floor = 0.001
+        self.gain = 1.2
         
     def process_chunk(self, audio_chunk: bytes) -> np.ndarray:
+        # Ensure audio_chunk length is multiple of 4 before converting to float32
+        if len(audio_chunk) % 4 != 0:
+            padding = 4 - (len(audio_chunk) % 4)
+            audio_chunk = audio_chunk + b'\x00' * padding
+            
         chunk_data = np.frombuffer(audio_chunk, dtype=np.float32)
         
-        # Normalize audio
         if len(chunk_data) > 0:
+            # Apply noise reduction
+            chunk_data = self._reduce_noise(chunk_data)
+            # Apply audio enhancement
+            chunk_data = self._enhance_audio(chunk_data)
+            # Normalize after enhancement
             chunk_data = chunk_data / np.max(np.abs(chunk_data))
         
         self.buffer = np.append(self.buffer, chunk_data)
@@ -51,14 +61,40 @@ class AudioProcessor:
             chunk_to_process = self.buffer[:self.config.chunk_size]
             # Keep overlap for continuity
             self.buffer = self.buffer[-self.config.overlap_size:]
-            
-            # Ensure 4-byte alignment
-            if len(chunk_to_process) % 4 != 0:
-                padding = 4 - (len(chunk_to_process) % 4)
-                chunk_to_process = np.pad(chunk_to_process, (0, padding), mode='constant')
-            
             return chunk_to_process
         return None
+
+    def _reduce_noise(self, audio: np.ndarray) -> np.ndarray:
+        """Apply simple noise reduction using spectral gating"""
+        # Estimate noise floor from quiet parts
+        noise_mask = np.abs(audio) < self.noise_floor
+        if np.any(noise_mask):
+            noise_estimate = np.mean(np.abs(audio[noise_mask]))
+            # Apply soft threshold
+            reduction = np.maximum(0, np.abs(audio) - noise_estimate * self.noise_reduce_strength)
+            return np.sign(audio) * reduction
+        return audio
+
+    def _enhance_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Enhance audio clarity"""
+        # Apply subtle compression
+        threshold = 0.3
+        ratio = 0.6
+        makeup_gain = self.gain
+
+        # Calculate amplitude envelope
+        amplitude = np.abs(audio)
+        mask = amplitude > threshold
+        
+        if np.any(mask):
+            # Apply compression only to samples above threshold
+            compressed = np.copy(audio)
+            compressed[mask] *= (1 + (threshold - amplitude[mask]) * (1 - ratio))
+            # Apply makeup gain
+            compressed *= makeup_gain
+            return compressed
+        
+        return audio * makeup_gain
 
 class TranscriptionWorker:
     """Manages transcription processing"""
@@ -68,6 +104,8 @@ class TranscriptionWorker:
         self.queue = queue.Queue()
         self._setup_processing()
         self.pending_tasks = []  # Track pending transcription tasks
+        self.previous_text = ""  # Add buffer for previous text
+        self.text_buffer = []    # Add buffer for collecting text segments
 
     def _setup_processing(self):
         self.transcription_params = {
@@ -77,15 +115,15 @@ class TranscriptionWorker:
             'patience': 1.5,  # Reduced for faster processing
             
             # Enhanced repetition prevention
-            'length_penalty': 1.2,  # Increased to favor longer, more complete transcriptions
-            'repetition_penalty': 1.3,  # Increased to better prevent repetition
+            'length_penalty': 0.8,        # Reduced to avoid over-penalizing longer segments
+            'repetition_penalty': 1.1,    # Reduced to avoid over-aggressive repetition prevention
             'no_repeat_ngram_size': 3,  # Increased to catch longer repeated phrases
             
             # Refined confidence thresholds
             'temperature': 0.0,  # Keep deterministic
-            'compression_ratio_threshold': 2.4,  # Increased to better handle natural speech
-            'log_prob_threshold': -0.8,  # Adjusted for better filtering
-            'no_speech_threshold': 0.4,  # Increased to better filter non-speech
+            'compression_ratio_threshold': 1.8,  # Reduced to be more permissive
+            'log_prob_threshold': -1.0,   # More permissive threshold
+            'no_speech_threshold': 0.5,  # More strict non-speech filtering
             
             # Enhanced context handling
             'condition_on_previous_text': True,
@@ -104,11 +142,15 @@ class TranscriptionWorker:
             # Optimized VAD parameters
             'vad_filter': True,
             'vad_parameters': {
-                'min_silence_duration_ms': 300,  # Reduced for more natural breaks
-                'speech_pad_ms': 150,  # Increased for better context
-                'min_speech_duration_ms': 150,  # Reduced to catch shorter utterances
-                'max_speech_duration_s': 6.0  # Increased for longer phrases
-            }
+                'min_silence_duration_ms': 500,  # Increased for better sentence grouping
+                'speech_pad_ms': 300,           # Increased padding
+                'min_speech_duration_ms': 250,  # Increased minimum duration
+                'max_speech_duration_s': 10.0   # Increased for longer phrases
+            },
+            
+            # Add language forcing
+            'language': 'en',  # Force English language
+            'task': 'transcribe',  # Force transcription task
         }
 
     async def transcribe(self, audio_data: np.ndarray) -> Dict:
@@ -131,20 +173,32 @@ class TranscriptionWorker:
             return {"results": {"channels": []}}
 
     def _process_segments(self, segments: List) -> str:
-        transcription = []
-        prev_text = ""
+        current_segments = []
         
         for segment in segments:
             text = segment.text.strip()
-            # Enhanced similarity check with context
-            if text and not self._is_similar(text, prev_text):
-                # Clean up common transcription artifacts
+            if text:
+                # Clean up the text
                 text = self._clean_text(text)
-                if text:  # Only add if text remains after cleaning
-                    transcription.append(text)
-                    prev_text = text
+                
+                # Only add if it's not too similar to previous text
+                if not self._is_similar(text, self.previous_text):
+                    current_segments.append(text)
+                    self.previous_text = text
         
-        return " ".join(transcription)
+        # Combine segments and add to buffer
+        if current_segments:
+            combined_text = " ".join(current_segments)
+            self.text_buffer.append(combined_text)
+            
+            # Keep only last few segments in buffer to maintain context
+            if len(self.text_buffer) > 3:
+                self.text_buffer.pop(0)
+            
+            # Return combined recent segments for more continuous output
+            return " ".join(self.text_buffer)
+        
+        return ""
 
     def _create_response(self, transcription: str, segments) -> Dict:
         return {
@@ -165,15 +219,18 @@ class TranscriptionWorker:
             }
         }
 
-    @staticmethod
-    def _clean_text(text: str) -> str:
+    def _clean_text(self, text: str) -> str:
         """Clean up common transcription artifacts"""
+        # Remove non-English characters
+        text = re.sub(r'[^\x00-\x7F]+', '', text)
         # Remove multiple spaces
         text = re.sub(r'\s+', ' ', text)
         # Remove standalone punctuation
         text = re.sub(r'\s*([,.!?])\s*', r'\1 ', text)
         # Remove repeated punctuation
         text = re.sub(r'([,.!?])\1+', r'\1', text)
+        # Remove single-character words except 'a' and 'i'
+        text = re.sub(r'\b[b-hj-z]\b', '', text, flags=re.IGNORECASE)
         return text.strip()
 
     @staticmethod
@@ -184,140 +241,62 @@ class TranscriptionWorker:
         text2 = re.sub(r'\s+', ' ', text2.lower().strip())
         return difflib.SequenceMatcher(None, text1, text2).ratio() > threshold
 
-async def handle_client(websocket, worker: TranscriptionWorker):
-    """Handle individual client connection"""
-    audio_config = AudioConfig()
-    processor = AudioProcessor(audio_config)
-    final_buffer = None
-    pending_chunks = []  # Track chunks being processed
-    
-    try:
-        async for message in websocket:
-            if not isinstance(message, bytes):
-                continue
-            
-            if message == b"EOS":
-                # Wait for all pending transcriptions to complete
-                for task in pending_chunks:
-                    response = await task
-                    await websocket.send(json.dumps(response))
-                
-                if len(processor.buffer) > 0:
-                    final_buffer = processor.buffer
-                    response = await worker.transcribe(final_buffer)
-                    await websocket.send(json.dumps(response))
-                
-                logging.info("Received EOS signal, closing connection")
-                await websocket.close(code=1000, reason="Transcription completed")
-                break
-                
-            chunk = processor.process_chunk(message)
-            if chunk is not None:
-                # Process chunk asynchronously
-                transcription_task = asyncio.create_task(worker.transcribe(chunk))
-                pending_chunks.append(transcription_task)
-                
-                # Process completed transcriptions
-                completed = []
-                for task in pending_chunks:
-                    if task.done():
-                        response = await task
-                        await websocket.send(json.dumps(response))
-                        completed.append(task)
-                
-                # Remove completed tasks
-                for task in completed:
-                    pending_chunks.remove(task)
-    except websockets.exceptions.ConnectionClosedOK:
-        logging.info("Client disconnected normally")
-    except websockets.exceptions.ConnectionClosedError as e:
-        logging.warning(f"Connection closed unexpectedly: {e}")
-    except Exception as e:
-        logging.error(f"Error handling client: {e}")
-        try:
-            await websocket.close(code=1011, reason=f"Internal server error: {str(e)}")
-        except:
-            pass
-    finally:
-        # Clean up resources
-        processor.buffer = np.array([], dtype=np.float32)
+class TranscriptionService:
+    """Handles audio transcription"""
+    def __init__(self, model_path: str, num_workers: int = 4):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = self._initialize_model(model_path, num_workers)
+        self.worker = TranscriptionWorker(self.model, num_workers)
+        self.audio_config = AudioConfig()
+        self.processor = AudioProcessor(self.audio_config)
+        
+    def _initialize_model(self, model_path: str, num_workers: int) -> WhisperModel:
+        """Initialize and optimize the Whisper model"""
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.cuda.set_per_process_memory_fraction(0.85, device=0)
+        
+        return WhisperModel(
+            model_path,
+            device=self.device,
+            compute_type="float16" if self.device == "cuda" else "int8",
+            cpu_threads=num_workers if self.device == "cpu" else 4,
+            num_workers=num_workers
+        )
 
-def initialize_model(model_path: str, device: str, num_workers: int) -> WhisperModel:
-    """Initialize and optimize the Whisper model"""
-    if device == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True  # Enable TensorFloat-32
-        torch.cuda.set_per_process_memory_fraction(0.85, device=0)
-    
-    return WhisperModel(
-        model_path,
-        device=device,
-        compute_type="float16" if device == "cuda" else "int8",
-        cpu_threads=num_workers if device == "cpu" else 4,
-        num_workers=num_workers
-    )
+    async def process_audio(self, audio_chunk: bytes) -> Dict:
+        """Process a chunk of audio data"""
+        chunk = self.processor.process_chunk(audio_chunk)
+        if chunk is not None:
+            return await self.worker.transcribe(chunk)
+        return {"results": {"channels": []}}
 
-async def start_server(model_path: str, port: int, num_workers: int):
-    """Start the WebSocket server"""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logging.info(f"Using device: {device}")
-    
-    model = initialize_model(model_path, device, num_workers)
-    worker = TranscriptionWorker(model, num_workers)
-    
-    stop = asyncio.Event()
-    server = await websockets.serve(
-        lambda ws: handle_client(ws, worker),
-        "localhost",
-        port
-    )
-    
-    logging.info(f"Server started on ws://localhost:{port}")
-    
-    try:
-        await stop.wait()  # Wait until stop event is set
-    finally:
-        server.close()
-        await server.wait_closed()
-        worker.executor.shutdown(wait=True)
-        logging.info("Server shutdown complete")
+    async def finalize(self) -> Dict:
+        """Process any remaining audio in the buffer"""
+        if len(self.processor.buffer) > 0:
+            return await self.worker.transcribe(self.processor.buffer)
+        return {"results": {"channels": []}}
 
-def start_websocket_server(model_path: str, port: int, num_workers: int):
-    """Initialize and start the WebSocket server"""
-    loop = asyncio.get_event_loop()
-    main_task = asyncio.ensure_future(start_server(model_path, port, num_workers))
-    
-    def signal_handler():
-        logging.info("Shutting down server...")
-        main_task.cancel()
-    
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
-    
-    try:
-        loop.run_until_complete(main_task)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        loop.close()
-        logging.info("Server shutdown complete")
-
-# Main server class and startup code remains similar, but uses these optimized components
+    def cleanup(self):
+        """Clean up resources"""
+        self.worker.executor.shutdown(wait=True)
+        self.processor.buffer = np.array([], dtype=np.float32)
 
 def _main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="WebSocket transcription service")
-
-    parser.add_argument('-m', '--model', default='large-v3', type=str, help="Whisper model path, default to %(default)s")
-    parser.add_argument('-ws', '--websocket_port', type=int, default=8765, help="WebSocket server port, default to %(default)s")
-    parser.add_argument('-w', '--workers', type=int, default=11, help="Number of threads for parallel processing (default: 11)")
-    parser.add_argument(
-        '-l', '--log_level', default='INFO', type=str, help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
-    )
+    """Example usage"""
+    parser = argparse.ArgumentParser(description="Audio transcription service")
+    parser.add_argument('-m', '--model', default='large-v3', type=str, help="Whisper model path")
+    parser.add_argument('-w', '--workers', type=int, default=4, help="Number of worker threads")
+    parser.add_argument('-l', '--log_level', default='INFO', type=str, 
+                       help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
     
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
-    start_websocket_server(model_path=args.model, port=args.websocket_port, num_workers=args.workers)
+    
+    # Example usage
+    service = TranscriptionService(model_path=args.model, num_workers=args.workers)
+    # Use service.process_audio() and service.finalize() as needed
 
 if __name__ == '__main__':
     _main()
